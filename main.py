@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.agent import KnowledgeBaseAgent
+from src.chunking import SentenceChunker
 from src.embeddings import (
     EMBEDDING_PROVIDER_ENV,
     LOCAL_EMBEDDING_MODEL,
@@ -19,12 +20,7 @@ from src.models import Document
 from src.store import EmbeddingStore
 
 SAMPLE_FILES = [
-    "data/python_intro.txt",
-    "data/vector_store_notes.md",
-    "data/rag_system_design.md",
-    "data/customer_support_playbook.txt",
-    "data/chunking_experiment_report.md",
-    "data/vi_retrieval_notes.md",
+    "data/2019-09-02 Giao trinh Triet hoc (Khong chuyen).docx.md"
 ]
 
 
@@ -60,6 +56,28 @@ def demo_llm(prompt: str) -> str:
     """A simple mock LLM for manual RAG testing."""
     preview = prompt[:400].replace("\n", " ")
     return f"[DEMO LLM] Generated answer from prompt preview: {preview}..."
+
+
+def openai_llm(prompt: str) -> str:
+    """Use OpenAI gpt-4o-mini for RAG."""
+    try:
+        import os
+        from openai import OpenAI
+        
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return "[ERROR] OPENAI_API_KEY not set in .env"
+        
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"[ERROR] OpenAI API error: {str(e)}"
 
 
 def run_manual_demo(question: str | None = None, sample_files: list[str] | None = None) -> int:
@@ -100,21 +118,48 @@ def run_manual_demo(question: str | None = None, sample_files: list[str] | None 
 
     print(f"\nEmbedding backend: {getattr(embedder, '_backend_name', embedder.__class__.__name__)}")
 
-    store = EmbeddingStore(collection_name="manual_test_store", embedding_fn=embedder)
-    store.add_documents(docs)
+    # [FIXED] Use different collection name for different embedding providers
+    provider_suffix = "mock" if provider == "mock" else getattr(embedder, '_backend_name', provider)
+    collection_name = f"manual_test_store_{provider_suffix}"
+    
+    store = EmbeddingStore(collection_name=collection_name, embedding_fn=embedder)
+    
+    # [SKIP CHUNKING] Check if data already exists
+    collection_size = store.get_collection_size()
+    if collection_size == 0:
+        print("\n=== Chunking Documents (SentenceChunker) ===")
+        chunker = SentenceChunker(max_sentences_per_chunk=3)
+        chunked_docs = []
+        for doc in docs:
+            chunks = chunker.chunk(doc.content)
+            print(f"  - {doc.id}: {len(chunks)} chunks")
+            for i, chunk in enumerate(chunks):
+                chunked_docs.append(
+                    Document(
+                        id=f"{doc.id}_chunk_{i}",
+                        content=chunk,
+                        metadata={**doc.metadata, "chunk_index": i, "doc_id": doc.id}
+                    )
+                )
 
-    print(f"\nStored {store.get_collection_size()} documents in EmbeddingStore")
+        print(f"Total chunks created: {len(chunked_docs)}")
+        store.add_documents(chunked_docs)
+        print(f"Stored {store.get_collection_size()} chunks in EmbeddingStore")
+    else:
+        print(f"\n[SKIP CHUNKING] Found {collection_size} chunks in existing collection")
+        print("Reusing cached data from previous run")
     print("\n=== EmbeddingStore Search Test ===")
     print(f"Query: {query}")
     search_results = store.search(query, top_k=3)
     for index, result in enumerate(search_results, start=1):
-        print(f"{index}. score={result['score']:.3f} source={result['metadata'].get('source')}")
+        print(f"{index}. score={result['score']:.3f} source={result['metadata'].get('source')} chunk={result['metadata'].get('chunk_index')}")
         print(f"   content preview: {result['content'][:120].replace(chr(10), ' ')}...")
 
     print("\n=== KnowledgeBaseAgent Test ===")
-    agent = KnowledgeBaseAgent(store=store, llm_fn=demo_llm)
+    # [CHANGED] Use openai_llm instead of demo_llm
+    agent = KnowledgeBaseAgent(store=store, llm_fn=openai_llm)
     print(f"Question: {query}")
-    print("Agent answer:")
+    print("Agent answer (using gpt-4o-mini):")
     print(agent.answer(query, top_k=3))
     return 0
 
